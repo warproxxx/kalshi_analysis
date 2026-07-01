@@ -34,6 +34,9 @@ CATEGORIES_JSON = 'categories.json'
 
 COLUMNS = ['create_ts', 'ticker_name', 'contracts_traded', 'price']
 BASE_URL = 'https://kalshi-public-docs.s3.amazonaws.com/reporting/trade_data_{}.json'
+SERIES_URL = 'https://api.elections.kalshi.com/trade-api/v2/series'
+# Friendly renames applied to the API's category names.
+CATEGORY_ALIASES = {'Exotics': 'Parlay'}
 
 # One shared session -> connection pooling / keep-alive across all requests.
 _session = requests.Session()
@@ -187,8 +190,27 @@ def load_trades(parquet_dir=PARQUET_DIR, columns=None, polars=True,
 # --------------------------------------------------------------------------- #
 # 1 - Categorize
 # --------------------------------------------------------------------------- #
+def update_categories(path=CATEGORIES_JSON):
+    """Fetch every Kalshi series + its category from the API and write
+    {series_ticker: category} to categories.json. Re-run anytime to refresh.
+
+    This is the single source of truth for categories: the Kalshi `/series`
+    endpoint returns all ~11k series with authoritative category labels in one
+    call, so no manual curation is needed.
+    """
+    series = _session.get(SERIES_URL, timeout=30).json()['series']
+    cats = {s['ticker']: CATEGORY_ALIASES.get(s['category'], s['category'])
+            for s in series if s.get('ticker') and s.get('category')}
+    with open(path, 'w') as f:
+        json.dump(cats, f, indent=4, ensure_ascii=False, sort_keys=True)
+    from collections import Counter
+    print(f"Wrote {len(cats)} series categories -> {path}")
+    print(f"categories: {dict(Counter(cats.values()))}")
+    return cats
+
+
 def load_categories(path=CATEGORIES_JSON):
-    """Load the ticker-prefix -> category mapping."""
+    """Load the series-ticker -> category mapping (see update_categories)."""
     with open(path) as f:
         return json.load(f)
 
@@ -196,21 +218,21 @@ def load_categories(path=CATEGORIES_JSON):
 def categorize(df, categories=None):
     """Return `df` with a 'category' column.
 
-    Matches the first category key found in each ticker_name (one vectorized
-    pass). Works on either a polars or a pandas DataFrame and returns the same
-    type it was given.
+    Looks up each ticker's series prefix (the part before the first '-') in the
+    API-derived category map -- an exact match, so no substring collisions.
+    Works on a polars or pandas DataFrame and returns the same type.
     """
     if categories is None:
         categories = load_categories()
-    pattern = '|'.join(categories.keys())
     if isinstance(df, pl.DataFrame):
         return df.with_columns(
-            pl.col('ticker_name').str.extract(f'({pattern})', 1)
+            pl.col('ticker_name').str.extract(r'^([^-]+)-', 1)
               .replace_strict(categories, default='Uncategorized')
+              .fill_null('Uncategorized')
               .alias('category'))
     out = df.copy()
-    matched = out['ticker_name'].str.extract(f'({pattern})', expand=False)
-    out['category'] = matched.map(categories).fillna('Uncategorized')
+    prefix = out['ticker_name'].str.extract(r'^([^-]+)-', expand=False)
+    out['category'] = prefix.map(categories).fillna('Uncategorized')
     return out
 
 
