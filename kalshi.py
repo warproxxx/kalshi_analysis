@@ -67,6 +67,11 @@ def _fetch_and_save(args):
         df = df[cols]
         if 'create_ts' in df.columns:
             df['create_ts'] = pd.to_datetime(df['create_ts'], utc=True)
+        # Normalize numeric dtypes so every day-file has the same schema
+        # (raw JSON gives ints some days, strings others).
+        for c in ('contracts_traded', 'price'):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce').astype('Int64')
         # temp-then-rename -> never leave a half-written file that the resume
         # logic would mistake for a completed day.
         path = _path_for(out_dir, date_str)
@@ -78,9 +83,12 @@ def _fetch_and_save(args):
         return date_str, 'failed'
 
 
-def download_kalshi_data(out_dir=PARQUET_DIR, months_back=3,
+def download_kalshi_data(out_dir=PARQUET_DIR, months_back=3, start=None,
                          max_workers=8, overwrite=False):
-    """Download the last `months_back` months as one parquet file per day.
+    """Download Kalshi trades as one parquet file per day.
+
+    Date window: pass start='YYYY-MM-DD' for a fixed start date, otherwise the
+    last `months_back` months. End is always yesterday.
 
     Resume is automatic: any date whose parquet already exists is skipped
     (pass overwrite=True to force re-download). Days are fetched in parallel;
@@ -88,7 +96,10 @@ def download_kalshi_data(out_dir=PARQUET_DIR, months_back=3,
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    start_date = (datetime.now() - timedelta(days=30 * months_back)).date()
+    if start is not None:
+        start_date = datetime.strptime(start, '%Y-%m-%d').date()
+    else:
+        start_date = (datetime.now() - timedelta(days=30 * months_back)).date()
     end_date = (datetime.now() - timedelta(days=1)).date()
 
     dates, d = [], start_date
@@ -146,10 +157,23 @@ def load_trades(parquet_dir=PARQUET_DIR, columns=None, polars=True,
     columns at read time. Falls back to the legacy CSV dump if no parquet yet.
     """
     glob_path = os.path.join(parquet_dir, '*.parquet')
-    if glob.glob(glob_path):
-        df = pl.read_parquet(glob_path, columns=columns)
+    files = sorted(glob.glob(glob_path))
+    if files:
+        try:
+            df = pl.read_parquet(glob_path, columns=columns)
+        except pl.exceptions.SchemaError:
+            # Day-files can disagree on dtype (contracts_traded/price written as
+            # String some days, Int64 others). Read each with the numeric cols
+            # cast to a common type, then concat.
+            lfs = [pl.scan_parquet(f).with_columns(
+                       pl.col('contracts_traded').cast(pl.Utf8),
+                       pl.col('price').cast(pl.Utf8))
+                   for f in files]
+            df = pl.concat(lfs, how='vertical').collect()
+            if columns:
+                df = df.select(columns)
         df = _coerce_numeric(df)
-        print(f"Loaded {df.height:,} rows from parquet")
+        print(f"Loaded {df.height:,} rows from {len(files)} parquet files")
         return df if polars else df.to_pandas()
     if csv_fallback and os.path.exists(csv_fallback):
         print(f"Loading {csv_fallback} (CSV fallback)")
